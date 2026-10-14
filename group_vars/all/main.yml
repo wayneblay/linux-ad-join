@@ -13,8 +13,11 @@ ad_login_groups:
 ad_sudo_group: linux-prod-admins
 ad_sudo_nopasswd: false                   # true = sudo without password prompt (not recommended)
 
-# ---- Time sync (Kerberos fails beyond 5 min skew) ----
-ntp_servers:
+# ---- Time sync (Kerberos fails beyond 5 min skew from the DCs) ----
+# false = leave the servers' current NTP setup alone (e.g. RHEL NTP pool)
+# true  = point chrony at the domain controllers listed in ntp_servers
+manage_ntp: false
+ntp_servers:                              # only used when manage_ntp: true
   - dc01.corp.example.com
   - dc02.corp.example.com
 

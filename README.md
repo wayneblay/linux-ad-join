@@ -54,7 +54,7 @@ Each Linux server is **joined to the AD domain** using SSSD and realmd (built in
 | RHEL 8, 9 or 10 (or Rocky/Alma) | Playbook checks this |
 | On-prem Active Directory (AD DS) | Same AD the Windows PCs use |
 | DNS | Servers must use AD DNS (or DNS that forwards to it) |
-| Time sync | Clock skew must be < 5 minutes (playbook configures chrony) |
+| Time sync | Clock must be within 5 minutes of the DCs. RHEL NTP pool is fine if the DCs are also accurate |
 | Network access to DCs | See [Network / firewall](#network--firewall) |
 | A control node | Any Linux machine with SSH access to the servers |
 | Ansible | Free — `ansible-core` from RHEL repos, no license needed |
@@ -221,7 +221,8 @@ ansible -i inventory.ini linux_prod -u youradmin -m ping
 | `ad_login_groups` | `linux-prod-users`, `linux-prod-admins` | |
 | `ad_sudo_group` | `linux-prod-admins` | |
 | `ad_sudo_nopasswd` | `false` | keep `false` in production |
-| `ntp_servers` | your DC hostnames | |
+| `manage_ntp` | `false` | `false` keeps the existing NTP setup (e.g. RHEL pool); `true` switches to the DCs |
+| `ntp_servers` | your DC hostnames | only used when `manage_ntp: true` |
 | `use_fully_qualified_names` | `false` | log in as `jsmith` not `jsmith@domain` |
 | `enable_gssapi_sso` | `true` | passwordless SSH from domain PCs |
 
@@ -260,7 +261,7 @@ The playbook is **idempotent** — safe to re-run, and it's how you add new serv
 ### What the playbook does
 1. Checks the OS is RHEL 8/9/10 family
 2. Installs `realmd`, `sssd`, `adcli`, `oddjob-mkhomedir`, `krb5-workstation`, `chrony`, etc.
-3. Points chrony at the domain controllers
+3. Keeps the existing NTP setup (or points chrony at the DCs if `manage_ntp: true`) and checks the clock is synchronised
 4. Joins the domain (password from vault, hidden from logs)
 5. Deploys `sssd.conf` (group-based access, `passwd` → AD, cached credentials)
 6. Enables auto-created home directories (`authselect sssd with-mkhomedir`)
@@ -311,7 +312,7 @@ Then log in to a second server with the new password.
 |---|---|
 | `realm join` fails | `realm discover <domain>`; DNS; join account rights on the OU |
 | "Permission denied" for valid user | User in an allowed group? `sss_cache -E; systemctl restart sssd` |
-| Clock / Kerberos errors | `chronyc tracking` — skew must be < 5 min |
+| Clock / Kerberos errors | Compare `date -u` on the server with a DC (`w32tm /query /status`); must be < 5 min apart. If the DCs drift, set `manage_ntp: true` |
 | User not found | `id jsmith`; `journalctl -u sssd`; add `debug_level = 6` to `sssd.conf` |
 | Login works, `passwd` fails | Port 464 blocked, or AD password policy (length, history, min age) |
 | Group change not applied | `sss_cache -u jsmith` |

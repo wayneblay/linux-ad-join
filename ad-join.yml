@@ -39,11 +39,14 @@
         state: present
 
     # ---------------------------------------------------------------- time sync
+    # Only when manage_ntp is true: switch chrony to the domain controllers.
+    # When false, the existing /etc/chrony.conf (e.g. RHEL NTP pool) is left as is.
     - name: Comment out default NTP pool/server lines
       ansible.builtin.replace:
         path: /etc/chrony.conf
         regexp: '^(pool|server) (?!.*# ad-join)(.*)$'
         replace: '# \1 \2'
+      when: manage_ntp | bool
       notify: Restart chronyd
 
     - name: Point chrony at the domain controllers
@@ -54,6 +57,7 @@
           {% for s in ntp_servers %}
           server {{ s }} iburst # ad-join
           {% endfor %}
+      when: manage_ntp | bool
       notify: Restart chronyd
 
     - name: Enable chronyd
@@ -65,14 +69,24 @@
     - name: Apply time settings before joining (Kerberos needs accurate clocks)
       ansible.builtin.meta: flush_handlers
 
+    - name: Check the clock is synchronised
+      ansible.builtin.command: chronyc -n tracking
+      register: chrony_tracking
+      check_mode: false
+      changed_when: false
+      failed_when: "'Not synchronised' in chrony_tracking.stdout"
+
     # --------------------------------------------------------------------- join
     - name: Check whether the host is already joined
       ansible.builtin.command: realm list --name-only
       register: realm_list
+      check_mode: false
       changed_when: false
+      failed_when: false
 
     - name: Confirm the domain is discoverable (DNS SRV records resolve)
       ansible.builtin.command: realm discover {{ ad_domain }}
+      check_mode: false
       changed_when: false
       when: ad_domain not in realm_list.stdout
 
@@ -105,6 +119,7 @@
     - name: Check current authselect profile
       ansible.builtin.command: authselect current --raw
       register: authselect_current
+      check_mode: false
       changed_when: false
       failed_when: false
 
@@ -141,6 +156,7 @@
     - name: Check whether sshd reads drop-in config files
       ansible.builtin.command: grep -Eq '^\s*Include\s+/etc/ssh/sshd_config.d/' /etc/ssh/sshd_config
       register: sshd_include
+      check_mode: false
       changed_when: false
       failed_when: false
 
