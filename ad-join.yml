@@ -123,6 +123,7 @@
         group: root
         mode: "0600"
         backup: true
+      ignore_errors: "{{ ansible_check_mode }}"   # dry run: package may not be installed yet
       notify: Restart sssd
 
     - name: Check current authselect profile
@@ -142,12 +143,14 @@
         name: oddjobd
         state: started
         enabled: true
+      ignore_errors: "{{ ansible_check_mode }}"   # dry run: package may not be installed yet
 
     - name: Enable sssd
       ansible.builtin.service:
         name: sssd
         state: started
         enabled: true
+      ignore_errors: "{{ ansible_check_mode }}"   # dry run: package may not be installed yet
 
     # --------------------------------------------------------------------- sudo
     - name: Grant sudo to the AD admin group
