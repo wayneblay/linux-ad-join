@@ -110,9 +110,23 @@
         JOIN_PW: "{{ ad_join_password }}"
       args:
         executable: /bin/bash
-      no_log: true
-      changed_when: true
+      register: join_result
+      no_log: true                 # keeps the password out of the output
+      changed_when: join_result.rc == 0
+      failed_when: false           # reported by the next task, without the password
       when: ad_domain not in realm_list.stdout
+
+    - name: Show why the join failed
+      ansible.builtin.fail:
+        msg: >-
+          realm join failed (rc={{ join_result.rc }}).
+          Last lines: {{ (join_result.stderr_lines | default([]))[-6:] | join(' | ') }}
+          -- Check: OU '{{ ad_computer_ou }}' exists, user '{{ ad_join_user }}' can create
+          computer objects there, the vault password is right, and the clock matches AD.
+      when:
+        - join_result is defined
+        - join_result.rc is defined
+        - join_result.rc != 0
 
     # --------------------------------------------------------------------- sssd
     - name: Deploy sssd.conf
