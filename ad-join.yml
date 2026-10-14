@@ -84,11 +84,20 @@
       changed_when: false
       failed_when: false
 
+    # In a dry run (--check) packages aren't really installed, so skip this
+    # check if realmd isn't on the server yet; the real run installs it first.
     - name: Confirm the domain is discoverable (DNS SRV records resolve)
       ansible.builtin.command: realm discover {{ ad_domain }}
       check_mode: false
       changed_when: false
-      when: ad_domain not in realm_list.stdout
+      when:
+        - ad_domain not in realm_list.stdout
+        - not (ansible_check_mode and (realm_list.rc | default(1)) != 0)
+
+    - name: Note skipped domain check in dry run
+      ansible.builtin.debug:
+        msg: "realmd not installed yet, so 'realm discover' was skipped in this dry run. Install it first to test discovery: dnf install -y realmd"
+      when: ansible_check_mode and (realm_list.rc | default(1)) != 0
 
     - name: Join the domain
       ansible.builtin.shell: >
