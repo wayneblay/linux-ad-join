@@ -4,6 +4,8 @@ Lets team members log in to our RHEL production servers with their **own Active 
 They can change their password on any server (or in Windows), and the change works on every server.
 AD is the single source of truth — nothing is copied or synced to the servers.
 
+**First time?** Follow [RUNBOOK.md](RUNBOOK.md) — a step-by-step checklist for piloting on one test server.
+
 ---
 
 ## Contents
@@ -343,6 +345,7 @@ Then log in to a second server with the new password.
 ```
 .
 ├── README.md
+├── RUNBOOK.md                  # step-by-step pilot checklist
 ├── ad-join.yml                 # the playbook
 ├── inventory.ini               # list of servers
 ├── vault.yml.example           # template for the encrypted join password
