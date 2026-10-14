@@ -1,0 +1,11 @@
+# Managed by Ansible (ad-join.yml)
+# Lets AD users log in with their AD password and handles the
+# "password expired - enter a new one" prompt at login.
+UsePAM yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+{% if enable_gssapi_sso %}
+# Passwordless SSO from domain-joined workstations holding a Kerberos ticket
+GSSAPIAuthentication yes
+GSSAPICleanupCredentials yes
+{% endif %}

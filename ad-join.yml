@@ -1,0 +1,210 @@
+---
+# Join RHEL 8/9 servers to Active Directory with SSSD so team members log in
+# with their AD credentials and can change their AD password with `passwd`.
+#
+# Run:   ansible-playbook -i inventory.ini ad-join.yml --ask-vault-pass
+# Test:  add  --limit <one-host>  first, and  --check --diff  for a dry run.
+
+- name: Join RHEL servers to Active Directory
+  hosts: linux_prod
+  become: true
+
+  vars_files:
+    - vault.yml
+
+  pre_tasks:
+    - name: Confirm this is RHEL (or a rebuild) 8 or 9
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "RedHat"
+          - ansible_distribution_major_version in ["8", "9", "10"]
+        fail_msg: "Supported on RHEL 8/9/10 family only (found {{ ansible_distribution }} {{ ansible_distribution_version }})"
+
+  tasks:
+    # ------------------------------------------------------------------ packages
+    - name: Install AD integration packages
+      ansible.builtin.dnf:
+        name:
+          - realmd
+          - sssd
+          - sssd-ad
+          - sssd-tools
+          - adcli
+          - oddjob
+          - oddjob-mkhomedir
+          - samba-common-tools
+          - krb5-workstation
+          - authselect
+          - chrony
+        state: present
+
+    # ---------------------------------------------------------------- time sync
+    - name: Comment out default NTP pool/server lines
+      ansible.builtin.replace:
+        path: /etc/chrony.conf
+        regexp: '^(pool|server) (?!.*# ad-join)(.*)$'
+        replace: '# \1 \2'
+      notify: Restart chronyd
+
+    - name: Point chrony at the domain controllers
+      ansible.builtin.blockinfile:
+        path: /etc/chrony.conf
+        marker: "# {mark} ANSIBLE MANAGED - AD time sources"
+        block: |
+          {% for s in ntp_servers %}
+          server {{ s }} iburst # ad-join
+          {% endfor %}
+      notify: Restart chronyd
+
+    - name: Enable chronyd
+      ansible.builtin.service:
+        name: chronyd
+        state: started
+        enabled: true
+
+    - name: Apply time settings before joining (Kerberos needs accurate clocks)
+      ansible.builtin.meta: flush_handlers
+
+    # --------------------------------------------------------------------- join
+    - name: Check whether the host is already joined
+      ansible.builtin.command: realm list --name-only
+      register: realm_list
+      changed_when: false
+
+    - name: Confirm the domain is discoverable (DNS SRV records resolve)
+      ansible.builtin.command: realm discover {{ ad_domain }}
+      changed_when: false
+      when: ad_domain not in realm_list.stdout
+
+    - name: Join the domain
+      ansible.builtin.shell: >
+        set -o pipefail;
+        printf '%s' "$JOIN_PW" | realm join --verbose
+        --user={{ ad_join_user | quote }}
+        --computer-ou={{ ad_computer_ou | quote }}
+        {{ ad_domain | quote }}
+      environment:
+        JOIN_PW: "{{ ad_join_password }}"
+      args:
+        executable: /bin/bash
+      no_log: true
+      changed_when: true
+      when: ad_domain not in realm_list.stdout
+
+    # --------------------------------------------------------------------- sssd
+    - name: Deploy sssd.conf
+      ansible.builtin.template:
+        src: sssd.conf.j2
+        dest: /etc/sssd/sssd.conf
+        owner: root
+        group: root
+        mode: "0600"
+        backup: true
+      notify: Restart sssd
+
+    - name: Check current authselect profile
+      ansible.builtin.command: authselect current --raw
+      register: authselect_current
+      changed_when: false
+      failed_when: false
+
+    - name: Use the SSSD auth profile with auto-created home directories
+      ansible.builtin.command: authselect select sssd with-mkhomedir --force
+      changed_when: true
+      when: "'sssd' not in authselect_current.stdout or 'with-mkhomedir' not in authselect_current.stdout"
+
+    - name: Enable oddjobd (creates home dirs on first login)
+      ansible.builtin.service:
+        name: oddjobd
+        state: started
+        enabled: true
+
+    - name: Enable sssd
+      ansible.builtin.service:
+        name: sssd
+        state: started
+        enabled: true
+
+    # --------------------------------------------------------------------- sudo
+    - name: Grant sudo to the AD admin group
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/ad-admins
+        content: |
+          # Managed by Ansible (ad-join.yml)
+          %{{ ad_sudo_group }} ALL=(ALL) {{ 'NOPASSWD: ' if ad_sudo_nopasswd else '' }}ALL
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+
+    # ---------------------------------------------------------------------- ssh
+    - name: Check whether sshd reads drop-in config files
+      ansible.builtin.command: grep -Eq '^\s*Include\s+/etc/ssh/sshd_config.d/' /etc/ssh/sshd_config
+      register: sshd_include
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy sshd drop-in (RHEL 9+)
+      ansible.builtin.template:
+        src: sshd-ad.conf.j2
+        dest: /etc/ssh/sshd_config.d/40-ad-auth.conf
+        owner: root
+        group: root
+        mode: "0600"
+        validate: /usr/sbin/sshd -t -f %s
+      when: sshd_include.rc == 0
+      notify: Reload sshd
+
+    - name: Set sshd options in main config (RHEL 8)
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^\s*#?\s*{{ item.key }}\s'
+        line: "{{ item.key }} {{ item.value }}"
+        validate: /usr/sbin/sshd -t -f %s
+        backup: true
+      loop: "{{ sshd_opts | dict2items }}"
+      vars:
+        sshd_opts: >-
+          {{ {'UsePAM': 'yes',
+              'PasswordAuthentication': 'yes',
+              'ChallengeResponseAuthentication': 'yes'}
+             | combine({'GSSAPIAuthentication': 'yes', 'GSSAPICleanupCredentials': 'yes'}
+                       if enable_gssapi_sso else {}) }}
+      when: sshd_include.rc != 0
+      notify: Reload sshd
+
+    # ------------------------------------------------------------------- verify
+    - name: Flush handlers so checks run against the new config
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify the join
+      ansible.builtin.command: realm list --name-only
+      register: realm_after
+      changed_when: false
+      failed_when: ad_domain not in realm_after.stdout
+
+    - name: Verify an AD user resolves (set ad_test_user to enable)
+      ansible.builtin.command: id {{ ad_test_user | quote }}
+      register: id_check
+      changed_when: false
+      when: ad_test_user is defined
+
+    - name: Show test user lookup
+      ansible.builtin.debug:
+        var: id_check.stdout
+      when: ad_test_user is defined
+
+  handlers:
+    - name: Restart chronyd
+      ansible.builtin.service:
+        name: chronyd
+        state: restarted
+
+    - name: Restart sssd
+      ansible.builtin.shell: sss_cache -E || true; systemctl restart sssd
+      changed_when: true
+
+    - name: Reload sshd
+      ansible.builtin.service:
+        name: sshd
+        state: reloaded

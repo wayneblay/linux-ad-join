@@ -1,0 +1,4 @@
+# Never commit the unencrypted join password.
+# If you encrypt vault.yml with ansible-vault and want it in git, remove this line.
+vault.yml
+*.retry
