@@ -4,7 +4,11 @@ Lets team members log in to our RHEL production servers with their **own Active 
 They can change their password on any server (or in Windows), and the change works on every server.
 AD is the single source of truth — nothing is copied or synced to the servers.
 
-**First time?** Follow [RUNBOOK.md](RUNBOOK.md) — a step-by-step checklist for piloting on one test server.
+**First time?** Follow [RUNBOOK.md](RUNBOOK.md) — a step-by-step checklist for piloting on one or two test servers.
+
+> **Example values used throughout:** domain `bob.net` (realm `BOB.NET`), computer OU `OU=Linux,DC=bob,DC=net`,
+> test servers `tester1` and `tester2`. Replace them with your real values **on the control node only** —
+> this repository is public, so never commit real domain names, IPs or passwords.
 
 ---
 
@@ -37,6 +41,7 @@ Each Linux server is **joined to the AD domain** using SSSD and realmd (built in
   - `linux-prod-users` → can log in
   - `linux-prod-admins` → can log in **and** use `sudo`
 - Being a Domain Admin does **not** grant access. Only membership in these groups does.
+- The **join account** is only used once per server, to join it. After that, the server uses its own computer account (`TESTER1$`) and each person logs in with their own AD account.
 
 ## What we gain
 
@@ -56,7 +61,7 @@ Each Linux server is **joined to the AD domain** using SSSD and realmd (built in
 | RHEL 8, 9 or 10 (or Rocky/Alma) | Playbook checks this |
 | On-prem Active Directory (AD DS) | Same AD the Windows PCs use |
 | DNS | Servers must use AD DNS (or DNS that forwards to it) |
-| Time sync | Clock must be within 5 minutes of the DCs. RHEL NTP pool is fine if the DCs are also accurate |
+| Time sync | Clock must be within 5 minutes of the DCs. The RHEL NTP pool is fine if the DCs are also accurate |
 | Network access to DCs | See [Network / firewall](#network--firewall) |
 | A control node | Any Linux machine with SSH access to the servers |
 | Ansible | Free — `ansible-core` from RHEL repos, no license needed |
@@ -74,7 +79,7 @@ Then confirm from a Linux server:
 
 ```bash
 sudo dnf install -y realmd
-realm discover ad.yourcompany.com
+realm discover bob.net
 ```
 
 You should see `type: kerberos` and `server-software: active-directory`.
@@ -86,36 +91,62 @@ You should see `type: kerberos` and `server-software: active-directory`.
 Nothing is installed on the domain controllers and no schema changes are needed.
 SSSD generates consistent Linux UIDs/GIDs from each user's AD SID.
 
+Run these in **PowerShell as administrator**, on a domain controller or on a machine with the AD module (RSAT).
+Each part of the domain becomes a `DC=`: `bob.net` → `DC=bob,DC=net`.
+Prefer clicking? Do the same in **Active Directory Users and Computers**.
+
 ### 1. Create an OU for the Linux servers
 
 Create this first: the groups below are placed inside it, so it must exist before them.
 
 ```powershell
-New-ADOrganizationalUnit -Name "Linux" -Path "DC=corp,DC=example,DC=com"
+New-ADOrganizationalUnit -Name "Linux" -Path "DC=bob,DC=net"
 ```
 
 ### 2. Create the security groups
 
 ```powershell
-New-ADGroup -Name "linux-prod-users"  -GroupScope Global -GroupCategory Security -Path "OU=Linux,DC=corp,DC=example,DC=com"
-New-ADGroup -Name "linux-prod-admins" -GroupScope Global -GroupCategory Security -Path "OU=Linux,DC=corp,DC=example,DC=com"
-
-Add-ADGroupMember -Identity "linux-prod-users"  -Members jsmith, mjones
-Add-ADGroupMember -Identity "linux-prod-admins" -Members jsmith
+New-ADGroup -Name "linux-prod-users"  -GroupScope Global -GroupCategory Security -Path "OU=Linux,DC=bob,DC=net"
+New-ADGroup -Name "linux-prod-admins" -GroupScope Global -GroupCategory Security -Path "OU=Linux,DC=bob,DC=net"
 ```
 
-Avoid spaces in group names. If you keep groups in an existing OU (e.g. `OU=Groups`), use that path instead. Whatever `-Path` names must already exist.
+Avoid spaces in group names. If you keep groups in an existing OU (e.g. `OU=Groups,DC=bob,DC=net`), use that path instead. Whatever `-Path` names must already exist.
 
-Run these in PowerShell as administrator on a domain controller, or on a machine with the AD module (RSAT). Each part of the domain becomes a `DC=` (`corp.example.com` → `DC=corp,DC=example,DC=com`).
+### 3. Add people to the groups
 
-### 3. Create the join service account
+```powershell
+Add-ADGroupMember -Identity "linux-prod-admins" -Members jsmith
+Add-ADGroupMember -Identity "linux-prod-users"  -Members mjones, akumar
+```
+
+Allow a minute or two for the change to reach all domain controllers.
+
+### 4. Check it worked
+
+```powershell
+Get-ADOrganizationalUnit -Filter 'Name -eq "Linux"' | Select DistinguishedName   # OU=Linux,DC=bob,DC=net
+Get-ADGroupMember "linux-prod-admins" | Select Name
+Get-ADGroupMember "linux-prod-users"  | Select Name
+```
+
+No passwords are involved in steps 1–4.
+
+### 5. Join account
+
+To join a server, the playbook needs an AD account that is allowed to create computer objects in the Linux OU
+(the same right used when a Windows PC is joined to the domain).
+
+- **Pilot:** use your own AD admin account (Domain Admin, or rights delegated on the Linux OU). No service account needed.
+- **Before full rollout:** create a dedicated account so your personal password isn't stored:
 
 ```powershell
 New-ADUser -Name "svc_linuxjoin" -SamAccountName "svc_linuxjoin" `
-  -Path "OU=Linux,DC=corp,DC=example,DC=com" `
-  -AccountPassword (Read-Host -AsSecureString "Password") `
+  -Path "OU=Linux,DC=bob,DC=net" `
+  -AccountPassword (Read-Host -AsSecureString "Enter password") `
   -Enabled $true -PasswordNeverExpires $true -CannotChangePassword $true
 ```
+
+PowerShell prompts for the password (nothing appears as you type). Paste the whole command at once; the backticks continue it over several lines.
 
 **Do not make it a Domain Admin.** Delegate rights on the Linux OU only:
 
@@ -129,8 +160,10 @@ New-ADUser -Name "svc_linuxjoin" -SamAccountName "svc_linuxjoin" `
    - Validated write to DNS host name
    - Validated write to service principal name
 
-### 4. DNS
-AD's SRV records already exist. Make sure each Linux server has an **A record** and ideally a **PTR record**.
+Then set `ad_join_user: svc_linuxjoin` and put its password in the vault.
+
+### 6. DNS
+AD's SRV records already exist. Make sure each Linux server has an **A record** (e.g. `tester1.bob.net`) and ideally a **PTR record**.
 
 ---
 
@@ -164,7 +197,7 @@ Every login and password change is checked against a domain controller, so the s
 |---|---|---|
 | 53 | TCP/UDP | DNS — find the domain controllers |
 | 88 | TCP/UDP | Kerberos — password check |
-| 123 | UDP | Time sync |
+| 123 | UDP | Time sync (only needed if servers sync time from the DCs) |
 | 389 | TCP/UDP | LDAP — user and group lookups |
 | 464 | TCP/UDP | Kerberos password change (`passwd`) |
 | 636 | TCP | LDAPS |
@@ -177,14 +210,22 @@ What breaks if blocked:
 
 ### Test from a Linux server
 
+Find the DC names first:
+
 ```bash
-DC=dc01.corp.example.com
+host -t SRV _ldap._tcp.bob.net      # last word on each line is a DC, e.g. dc01.bob.net.
+```
+
+Then paste this whole block at once (the `for` loop is one command):
+
+```bash
+DC=dc01.bob.net
 for p in 53 88 389 464 636 3268; do
   timeout 3 bash -c "</dev/tcp/$DC/$p" 2>/dev/null && echo "$p open" || echo "$p BLOCKED"
 done
 ```
 
-All `open` → no firewall request needed. Any `BLOCKED` → request those ports (TCP **and** UDP for 53, 88, 123, 464) from all servers to the DCs.
+All `open` → no firewall request needed. Any `BLOCKED` → request those ports (TCP **and** UDP for 53, 88, 464) from all servers to the DCs.
 RHEL's own `firewalld` allows outbound traffic by default, so no change is needed on the servers.
 
 ---
@@ -198,13 +239,15 @@ Nothing needs to be installed on the target servers.
 # 1. Install Ansible (free, from RHEL AppStream)
 sudo dnf install -y ansible-core
 
-# 2. SSH key access to every server (account with sudo)
-ssh-keygen -t ed25519
-for h in prod-app01 prod-app02 prod-db01; do ssh-copy-id youradmin@$h.corp.example.com; done
+# 2. Get the files - no GitHub login needed
+cd ~
+curl -L -o linux-ad-join.zip https://github.com/wayneblay/linux-ad-join/archive/refs/heads/main.zip
+unzip linux-ad-join.zip
+cd ~/linux-ad-join-main
 
-# 3. Get this repo and test connectivity
-git clone https://github.com/wayneblay/linux-ad-join.git && cd linux-ad-join
-ansible -i inventory.ini linux_prod -u youradmin -m ping
+# 3. SSH key access to each server (root, or an account with sudo) - skip if already set up
+ssh-keygen -t ed25519
+ssh-copy-id root@<TESTER1_IP>
 ```
 
 - Keep the Ansible connection account **local** (not AD) so you can still manage servers if AD is down. It doubles as break-glass access.
@@ -216,53 +259,80 @@ ansible -i inventory.ini linux_prod -u youradmin -m ping
 
 ## Configure the playbook
 
+Edit these on the control node (`vi <file>`; `i` to edit, `Esc` then `:wq` to save).
+
 ### `group_vars/all/main.yml`
 
 | Setting | Example | Notes |
 |---|---|---|
-| `ad_domain` | `ad.acme.com` | lowercase |
-| `ad_realm` | `AD.ACME.COM` | same name, uppercase |
-| `ad_computer_ou` | `OU=Linux,OU=Servers,DC=ad,DC=acme,DC=com` | each domain part becomes a `DC=` |
-| `ad_join_user` | `svc_linuxjoin` | |
-| `ad_login_groups` | `linux-prod-users`, `linux-prod-admins` | |
+| `ad_domain` | `bob.net` | lowercase |
+| `ad_realm` | `BOB.NET` | same name, uppercase |
+| `ad_computer_ou` | `OU=Linux,DC=bob,DC=net` | must match the OU you created (copy from step 4 above) |
+| `ad_join_user` | `jsmith` (pilot) or `svc_linuxjoin` | username only — no `BOB\` or `@bob.net` |
+| `ad_login_groups` | `linux-prod-users`, `linux-prod-admins` | must match AD group names exactly |
 | `ad_sudo_group` | `linux-prod-admins` | |
 | `ad_sudo_nopasswd` | `false` | keep `false` in production |
 | `manage_ntp` | `false` | `false` keeps the existing NTP setup (e.g. RHEL pool); `true` switches to the DCs |
-| `ntp_servers` | your DC hostnames | only used when `manage_ntp: true` |
-| `use_fully_qualified_names` | `false` | log in as `jsmith` not `jsmith@domain` |
+| `ntp_servers` | `dc01.bob.net` | only used when `manage_ntp: true` |
+| `use_fully_qualified_names` | `false` | log in as `jsmith`, not `jsmith@bob.net` |
 | `enable_gssapi_sso` | `true` | passwordless SSH from domain PCs |
 
 ### `inventory.ini`
-List all servers under `[linux_prod]`.
+
+Use the IP if the control node can't resolve the server name:
+
+```ini
+[linux_prod]
+tester1 ansible_host=<TESTER1_IP>
+tester2 ansible_host=<TESTER2_IP>
+```
+
+Already have your own group (e.g. `[myhosts]`)? The playbook targets `linux_prod`, so add:
+
+```ini
+[linux_prod:children]
+myhosts
+```
 
 ### Vault (join account password)
 
 ```bash
-cp vault.yml.example vault.yml     # put the svc_linuxjoin password in it
-ansible-vault encrypt vault.yml
+ansible-vault create vault.yml
 ```
 
-> Never commit an **unencrypted** `vault.yml`. It is listed in `.gitignore`; remove it from there only if you want to commit the encrypted file.
+1. Make up a **vault password** (not your AD password) — you type it on every run.
+2. Press `i` and type: `vault_ad_join_password: 'YourADPassword'` (keep the single quotes).
+3. `Esc`, `:wq`, Enter.
+
+`create` saves the file **already encrypted**. Check with `head -1 vault.yml` → `$ANSIBLE_VAULT;1.1;AES256`.
+Later: `ansible-vault view vault.yml` / `ansible-vault edit vault.yml` (e.g. after changing your AD password).
+
+> Never commit `vault.yml`. It is listed in `.gitignore`.
 
 ---
 
 ## Run it
 
 ```bash
-# 1. Dry run on one non-critical host
-ansible-playbook -i inventory.ini ad-join.yml -u youradmin -K --ask-vault-pass \
-  --limit prod-app01.corp.example.com --check --diff
+# 1. Check Ansible can reach the test servers
+ansible -i inventory.ini tester1,tester2 -u root -m ping
 
-# 2. Real run on that host, with a test user lookup
-ansible-playbook -i inventory.ini ad-join.yml -u youradmin -K --ask-vault-pass \
-  --limit prod-app01.corp.example.com -e ad_test_user=jsmith
+# 2. Dry run - shows what would change, changes nothing
+ansible-playbook -i inventory.ini ad-join.yml -u root --ask-vault-pass --limit tester1,tester2 --check --diff
 
-# 3. Everything (or in batches with --limit)
-ansible-playbook -i inventory.ini ad-join.yml -u youradmin -K --ask-vault-pass
+# 3. Real run, with a test user lookup
+ansible-playbook -i inventory.ini ad-join.yml -u root --ask-vault-pass --limit tester1,tester2 -e ad_test_user=jsmith
+
+# 4. Later: remaining servers in batches
+ansible-playbook -i inventory.ini ad-join.yml -u root --ask-vault-pass --limit server3,server4
 ```
 
-`-K` asks for the sudo password on the servers (omit if passwordless sudo).
+Connecting with a non-root account that uses sudo? Use `-u youradmin -K` instead of `-u root` (`-K` asks for the sudo password).
+
+The PLAY RECAP at the end must show `failed=0` for each server. If one fails, the others stay joined; fix it and re-run with `--limit` on just that server.
 The playbook is **idempotent** — safe to re-run, and it's how you add new servers later.
+
+**Hostnames:** `hostname -f` showing just `tester1` is fine — the join works with the short name. Don't rename production servers; apps, monitoring agents, licenses and certificates may depend on the name.
 
 ### What the playbook does
 1. Checks the OS is RHEL 8/9/10 family
@@ -279,16 +349,17 @@ The playbook is **idempotent** — safe to re-run, and it's how you add new serv
 
 ## Test
 
-Keep your existing root/SSH session open while testing.
+Keep a break-glass (local/root) session open to each server while testing.
 
 ```bash
-ssh jsmith@prod-app01        # AD password; home dir created automatically
+ssh jsmith@<TESTER1_IP>      # AD password; home dir created automatically
 id                           # shows AD groups
 sudo -l                      # admins only
 passwd                       # changes the AD password (must meet AD policy)
 ```
 
-Then log in to a second server with the new password.
+Then log in to `tester2` with the new password — that proves one password works everywhere.
+An AD account in **neither** group must get "Permission denied".
 
 ---
 
@@ -316,13 +387,19 @@ Then log in to a second server with the new password.
 
 | Symptom | Check |
 |---|---|
-| `realm join` fails | `realm discover <domain>`; DNS; join account rights on the OU |
+| `New-ADGroup`: "Directory object not found" | The OU in `-Path` doesn't exist yet — create the OU first |
+| `New-ADOrganizationalUnit` not recognized | No AD module — run on a DC or install RSAT |
+| `realm discover bob.net` fails | Server isn't using AD DNS — check `/etc/resolv.conf` |
+| `realm join` / "Join the domain" fails | Join account rights on the OU; `ad_join_user` and vault password; OU path |
+| `no hosts matched` | `--limit` name isn't in group `linux_prod` in `inventory.ini` |
 | "Permission denied" for valid user | User in an allowed group? `sss_cache -E; systemctl restart sssd` |
-| Clock / Kerberos errors | Compare `date -u` on the server with a DC (`w32tm /query /status`); must be < 5 min apart. If the DCs drift, set `manage_ntp: true` |
+| Clock / Kerberos errors | Compare with a DC: `sudo chronyd -Q 'server dc01.bob.net iburst'`; must be < 5 min. If the DCs drift, set `manage_ntp: true` |
 | User not found | `id jsmith`; `journalctl -u sssd`; add `debug_level = 6` to `sssd.conf` |
 | Login works, `passwd` fails | Port 464 blocked, or AD password policy (length, history, min age) |
 | Group change not applied | `sss_cache -u jsmith` |
 | Cloud password reset doesn't work on servers | Password Writeback not enabled in Entra Connect |
+
+More detail and an undo procedure: [RUNBOOK.md](RUNBOOK.md#part-7--if-something-fails).
 
 ---
 
@@ -330,17 +407,17 @@ Then log in to a second server with the new password.
 
 | Step | Work | Time |
 |---|---|---|
-| 1 | AD prep: groups, OU, join account; confirm firewall ports | ½ day |
+| 1 | AD prep: OU, groups, members; confirm firewall ports | ½ day |
 | 2 | Control node with Ansible | 1–2 hours |
-| 3 | Pilot on 1–2 non-critical servers; test login, password change, sudo | ½–1 day |
-| 4 | Roll out to remaining servers in batches | ½ day |
+| 3 | Pilot on 2 test servers; test login, password change, sudo | ½–1 day |
+| 4 | Create `svc_linuxjoin`; roll out to remaining servers in batches | ½ day |
 | 5 | Brief the team, document | 1–2 hours |
 
 **Total effort:** ~2–4 working days. Allow 1–2 weeks of calendar time if change approval or firewall requests are needed.
 
 **Cost:** none — uses tools included with RHEL plus free Ansible.
 
-**Risk:** low — piloted on one server first, rolled out in batches, local break-glass account kept on every server.
+**Risk:** low — piloted on test servers first, rolled out in batches, local break-glass account kept on every server.
 
 ---
 
@@ -352,10 +429,10 @@ Then log in to a second server with the new password.
 ├── RUNBOOK.md                  # step-by-step pilot checklist
 ├── ad-join.yml                 # the playbook
 ├── inventory.ini               # list of servers
-├── vault.yml.example           # template for the encrypted join password
+├── vault.yml.example           # shows the one line the vault needs
 ├── group_vars/
 │   └── all/
-│       └── main.yml            # domain, OU, groups, DCs, options
+│       └── main.yml            # domain, OU, groups, options
 └── templates/
     ├── sssd.conf.j2            # SSSD config
     └── sshd-ad.conf.j2         # SSH drop-in for RHEL 9+

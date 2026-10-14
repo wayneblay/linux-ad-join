@@ -1,9 +1,9 @@
-# Pilot Runbook: Join one test server to AD
+# Pilot Runbook: Join test servers to AD
 
-Step-by-step checklist for the first run on a single test server (`tester1`).
+Step-by-step checklist for the first run on test servers (`tester1`, optionally `tester2`). Examples use the domain `bob.net`.
 Work through the parts in order; each part ends with a check. Don't move on until it passes.
 
-> Replace everything in `<angle brackets>` with your real value and remove the brackets.
+> Replace everything in `<angle brackets>`, and the example domain `bob.net`, with your real values (remove the brackets).
 > Keep your real domain, server names, IPs and passwords **out of this repository**. Edit them only on the control node.
 
 | Part | What | Where | Time |
@@ -21,13 +21,13 @@ Work through the parts in order; each part ends with a check. Don't move on unti
 
 | Placeholder | Meaning | Example |
 |---|---|---|
-| `<yourdomain>` | AD domain, lowercase | `corp.example.com` |
-| `<YOURDOMAIN>` | Same, uppercase (Kerberos realm) | `CORP.EXAMPLE.COM` |
-| `<TESTER1_IP>` | Test server IP | `10.0.0.21` |
+| `bob.net` | Example AD domain, lowercase | your real domain |
+| `BOB.NET` | Same, uppercase (Kerberos realm) | your real domain, uppercase |
+| `<TESTER1_IP>` / `<TESTER2_IP>` | Test server IPs | `10.0.0.21` |
 | `<youradmin>` | Local account you SSH to tester1 with (or `root`) | `wayne` |
 | `<your-ad-username>` | AD account used to join (pilot only) | `jsmith` |
 | `<test-user>` | AD user in a Linux group, for testing | `jsmith` |
-| `<DC-NAME>` | A domain controller's full name | `dc01.corp.example.com` |
+| `<DC-NAME>` | A domain controller's full name | `dc01.bob.net` |
 
 ---
 
@@ -37,9 +37,9 @@ All of these must be true before you touch a server. Most are done in **Active D
 
 - [ ] **Approval:** your manager knows you're piloting on tester1. Raise a change request if your team uses them.
 - [ ] **AD admin informed:** you've agreed where the OU and groups go and who creates them.
-- [ ] **Linux OU exists.** Right-click the domain (or your Servers OU) → **New → Organizational Unit** → `Linux`. Note its full path, e.g. `OU=Linux,DC=corp,DC=example,DC=com` (each part of the domain becomes a `DC=`).
-- [ ] **Groups exist.** **New → Group**, scope **Global**, type **Security**: `linux-prod-users` (can log in) and `linux-prod-admins` (log in + sudo).
-- [ ] **A test user is in a group.** Ideally one account in `linux-prod-admins` and another in `linux-prod-users` only.
+- [ ] **Linux OU exists (create it first).** PowerShell as admin: `New-ADOrganizationalUnit -Name "Linux" -Path "DC=bob,DC=net"` — or in ADUC right-click the domain → **New → Organizational Unit**. Path: `OU=Linux,DC=bob,DC=net`.
+- [ ] **Groups exist, inside the OU.** `New-ADGroup -Name "linux-prod-users" -GroupScope Global -GroupCategory Security -Path "OU=Linux,DC=bob,DC=net"`, and the same for `linux-prod-admins`.
+- [ ] **A test user is in a group.** `Add-ADGroupMember -Identity "linux-prod-admins" -Members <test-user>`. Ideally a second account in `linux-prod-users` only. Wait a minute or two for it to reach all DCs.
 - [ ] **Your AD account can join computers:** Domain Admin, or "Create computer objects" delegated on the Linux OU. Local/Linux admin rights are not enough.
 - [ ] **DNS for tester1:** A record exists; PTR (reverse) record if possible.
 - [ ] **Break-glass access to tester1:** a local account or VM console that doesn't depend on AD. Keep a session open all the time.
@@ -63,7 +63,7 @@ cat /etc/redhat-release
 hostname -f
 ```
 
-Seeing just `tester1` (not `tester1.<yourdomain>`) is fine. **Don't change hostnames on production servers**: apps, monitoring agents, licenses and certificates may depend on them. The join works with the short name.
+Seeing just `tester1` (not `tester1.bob.net`) is fine. **Don't change hostnames on production servers**: apps, monitoring agents, licenses and certificates may depend on them. The join works with the short name.
 
 **3. DNS points at AD**
 
@@ -74,7 +74,7 @@ cat /etc/resolv.conf
 Expect something like:
 
 ```
-search <yourdomain>
+search bob.net
 nameserver 10.0.0.5
 nameserver 10.0.0.6
 ```
@@ -86,7 +86,7 @@ Problem: only public DNS (8.8.8.8, 1.1.1.1) or the router. Fix with `nmcli` on t
 
 ```bash
 sudo dnf install -y realmd
-realm discover <yourdomain>
+realm discover bob.net
 ```
 
 Pass: shows `type: kerberos`, `server-software: active-directory`, `configured: no`.
@@ -95,10 +95,10 @@ Fail: almost always DNS (step 3) or a firewall.
 **5. Find the domain controllers**
 
 ```bash
-host -t SRV _ldap._tcp.<yourdomain>
+host -t SRV _ldap._tcp.bob.net
 ```
 
-Output looks like `_ldap._tcp.<yourdomain> has SRV record 0 100 389 dc01.<yourdomain>.`
+Output looks like `_ldap._tcp.bob.net has SRV record 0 100 389 dc01.bob.net.`
 The last word on each line is a DC; use one for step 6 (without the trailing dot).
 `host: command not found` → `sudo dnf install -y bind-utils`. `NXDOMAIN` → DNS problem (step 3).
 
@@ -149,12 +149,19 @@ ansible --version
 sudo dnf install -y ansible-core      # only if missing
 ```
 
-**3. Inventory** – tester1 by IP:
+**3. Inventory** – test servers by IP (delete the tester2 line to test only one):
 
 ```bash
-printf '[linux_prod]\ntester1 ansible_host=<TESTER1_IP>\n' > inventory.ini
-cat inventory.ini
+vi inventory.ini
 ```
+
+```ini
+[linux_prod]
+tester1 ansible_host=<TESTER1_IP>
+tester2 ansible_host=<TESTER2_IP>
+```
+
+With two servers, use `--limit tester1,tester2` instead of `--limit tester1` in Parts 4 and 5, and do Parts 2 and 6 on **each** server.
 
 Already have your own group (e.g. `[myhosts]` with two test servers)? The playbook targets the group `linux_prod`, so add this to `inventory.ini` and use `--limit myhosts`:
 
@@ -172,9 +179,9 @@ vi group_vars/all/main.yml
 (`i` to edit, `Esc` then `:wq` to save)
 
 ```yaml
-ad_domain: <yourdomain>
-ad_realm: <YOURDOMAIN>
-ad_computer_ou: "OU=Linux,DC=corp,DC=example,DC=com"   # your real OU path
+ad_domain: bob.net
+ad_realm: BOB.NET
+ad_computer_ou: "OU=Linux,DC=bob,DC=net"   # your real OU path
 ad_join_user: <your-ad-username>                       # username only, no DOMAIN\ or @domain
 manage_ntp: false                                      # keep existing NTP (e.g. RHEL pool)
 ```
@@ -295,7 +302,7 @@ sudo -l                          # admins: (ALL) ALL after AD password; users: r
 Revert the VM snapshot if you have one. Otherwise, from the break-glass session:
 
 ```bash
-sudo realm leave <yourdomain>
+sudo realm leave bob.net
 sudo rm -f /etc/sudoers.d/ad-admins
 sudo rm -f /etc/ssh/sshd_config.d/40-ad-auth.conf     # RHEL 9+
 sudo systemctl reload sshd

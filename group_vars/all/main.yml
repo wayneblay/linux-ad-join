@@ -1,12 +1,15 @@
 ---
-# ---- Active Directory ----
-ad_domain: corp.example.com               # lowercase DNS name of the domain
-ad_realm: CORP.EXAMPLE.COM                # same, uppercase (Kerberos realm)
-ad_computer_ou: "OU=Linux,OU=Servers,DC=corp,DC=example,DC=com"
-ad_join_user: svc_linuxjoin               # account with rights to create computer objects in the OU above
-ad_join_password: "{{ vault_ad_join_password }}"   # stored in vault.yml (encrypted)
+# Example values for the domain bob.net - replace with your real values on the control node.
 
-# ---- Access control (AD group names, no domain suffix) ----
+# ---- Active Directory ----
+ad_domain: bob.net                        # lowercase DNS name of the domain
+ad_realm: BOB.NET                         # same, uppercase (Kerberos realm)
+ad_computer_ou: "OU=Linux,DC=bob,DC=net"  # OU the servers' computer accounts are created in
+ad_join_user: svc_linuxjoin               # pilot: your own AD admin username; rollout: svc_linuxjoin
+                                          # username only - no BOB\ prefix or @bob.net
+ad_join_password: "{{ vault_ad_join_password }}"   # stored in vault.yml (encrypted) - leave as is
+
+# ---- Access control (AD group names, must match AD exactly) ----
 ad_login_groups:
   - linux-prod-users
   - linux-prod-admins
@@ -18,10 +21,10 @@ ad_sudo_nopasswd: false                   # true = sudo without password prompt 
 # true  = point chrony at the domain controllers listed in ntp_servers
 manage_ntp: false
 ntp_servers:                              # only used when manage_ntp: true
-  - dc01.corp.example.com
-  - dc02.corp.example.com
+  - dc01.bob.net
+  - dc02.bob.net
 
 # ---- Login behaviour ----
-use_fully_qualified_names: false          # log in as "jsmith" rather than "jsmith@corp.example.com"
+use_fully_qualified_names: false          # log in as "jsmith" rather than "jsmith@bob.net"
 home_dir_pattern: /home/%u
 enable_gssapi_sso: true                   # passwordless SSH from domain-joined workstations via Kerberos
