@@ -86,29 +86,33 @@ You should see `type: kerberos` and `server-software: active-directory`.
 Nothing is installed on the domain controllers and no schema changes are needed.
 SSSD generates consistent Linux UIDs/GIDs from each user's AD SID.
 
-### 1. Create the security groups
+### 1. Create an OU for the Linux servers
+
+Create this first: the groups below are placed inside it, so it must exist before them.
 
 ```powershell
-New-ADGroup -Name "linux-prod-users"  -GroupScope Global -GroupCategory Security -Path "OU=Groups,DC=corp,DC=example,DC=com"
-New-ADGroup -Name "linux-prod-admins" -GroupScope Global -GroupCategory Security -Path "OU=Groups,DC=corp,DC=example,DC=com"
+New-ADOrganizationalUnit -Name "Linux" -Path "DC=corp,DC=example,DC=com"
+```
+
+### 2. Create the security groups
+
+```powershell
+New-ADGroup -Name "linux-prod-users"  -GroupScope Global -GroupCategory Security -Path "OU=Linux,DC=corp,DC=example,DC=com"
+New-ADGroup -Name "linux-prod-admins" -GroupScope Global -GroupCategory Security -Path "OU=Linux,DC=corp,DC=example,DC=com"
 
 Add-ADGroupMember -Identity "linux-prod-users"  -Members jsmith, mjones
 Add-ADGroupMember -Identity "linux-prod-admins" -Members jsmith
 ```
 
-Avoid spaces in group names.
+Avoid spaces in group names. If you keep groups in an existing OU (e.g. `OU=Groups`), use that path instead. Whatever `-Path` names must already exist.
 
-### 2. Create an OU for the Linux servers
-
-```powershell
-New-ADOrganizationalUnit -Name "Linux" -Path "OU=Servers,DC=corp,DC=example,DC=com"
-```
+Run these in PowerShell as administrator on a domain controller, or on a machine with the AD module (RSAT). Each part of the domain becomes a `DC=` (`corp.example.com` → `DC=corp,DC=example,DC=com`).
 
 ### 3. Create the join service account
 
 ```powershell
 New-ADUser -Name "svc_linuxjoin" -SamAccountName "svc_linuxjoin" `
-  -Path "OU=Service Accounts,DC=corp,DC=example,DC=com" `
+  -Path "OU=Linux,DC=corp,DC=example,DC=com" `
   -AccountPassword (Read-Host -AsSecureString "Password") `
   -Enabled $true -PasswordNeverExpires $true -CannotChangePassword $true
 ```
