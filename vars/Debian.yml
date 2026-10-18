@@ -1,0 +1,19 @@
+---
+# Ubuntu 22.04 and newer
+adjoin_packages:
+  - realmd
+  - sssd
+  - sssd-ad
+  - sssd-tools
+  - adcli
+  - libnss-sss
+  - libpam-sss
+  - samba-common-bin
+  - krb5-user
+  - packagekit                # realmd uses it to confirm required packages
+pam_tool: pam-auth-update
+mkhomedir_service: ""         # Ubuntu uses pam_mkhomedir; no extra service
+chrony_conf: /etc/chrony/chrony.conf
+chrony_service: chrony
+chrony_package: chrony        # only installed when manage_ntp: true (replaces systemd-timesyncd)
+ssh_service: ssh

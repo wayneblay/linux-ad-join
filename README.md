@@ -1,6 +1,6 @@
-# Linux Server Login with Active Directory (RHEL + SSSD)
+# Linux Server Login with Active Directory (RHEL + Ubuntu, SSSD)
 
-Lets team members log in to our RHEL production servers with their **own Active Directory username and password**.
+Lets team members log in to our Linux production servers (RHEL 7–10, Ubuntu 22.04+) with their **own Active Directory username and password**.
 They can change their password on any server (or in Windows), and the change works on every server.
 AD is the single source of truth — nothing is copied or synced to the servers.
 
@@ -13,7 +13,7 @@ AD is the single source of truth — nothing is copied or synced to the servers.
 ---
 
 ## Contents
-1. [How it works](#how-it-works)
+1. [How it works](#how-it-works) · [Supported systems](#supported-systems)
 2. [What we gain](#what-we-gain)
 3. [Prerequisites](#prerequisites)
 4. [Active Directory setup](#active-directory-setup)
@@ -43,6 +43,28 @@ Each Linux server is **joined to the AD domain** using SSSD and realmd (built in
 - Being a Domain Admin does **not** grant access. Only membership in these groups does.
 - The **join account** is only used once per server, to join it. After that, the server uses its own computer account (`TESTER1$`) and each person logs in with their own AD account.
 
+
+## Supported systems
+
+| OS | Versions | Notes |
+|---|---|---|
+| RHEL / Rocky / Alma | 8, 9, 10 | Main target |
+| RHEL / CentOS | 7 | Works, but RHEL 7 is past end of life — plan an upgrade. See [RHEL 7 notes](#rhel-7-notes) |
+| Ubuntu | 22.04 and newer | See [Ubuntu notes](#ubuntu-notes) |
+
+The playbook detects each server's OS and uses the right steps for it, so one inventory and one run cover a mixed fleet.
+It also checks first that Ansible can actually manage each server, installs Python 3 on servers that have none,
+and stops with exact instructions if your Ansible version is too new for a server's Python (see [RHEL 7 notes](#rhel-7-notes)).
+
+| Step | RHEL 8/9/10 | RHEL 7 | Ubuntu 22.04+ |
+|---|---|---|---|
+| Packages | `dnf` | `yum` | `apt` |
+| SSSD logins + home dirs | `authselect` | `authconfig` | `pam-auth-update` |
+| SSH config | drop-in (9+) / main file (8) | main file | drop-in |
+| SSH service | `sshd` | `sshd` | `ssh` |
+
+Domain join, `sssd.conf`, group-based access, sudo, logins and `passwd` work the same on all of them.
+
 ## What we gain
 
 - **One login** on all servers — no local accounts to create or maintain.
@@ -58,7 +80,7 @@ Each Linux server is **joined to the AD domain** using SSSD and realmd (built in
 
 | Item | Notes |
 |---|---|
-| RHEL 8, 9 or 10 (or Rocky/Alma) | Playbook checks this |
+| RHEL 7–10 (or Rocky/Alma), Ubuntu 22.04+ | Playbook checks this — see [Supported systems](#supported-systems) |
 | On-prem Active Directory (AD DS) | Same AD the Windows PCs use |
 | DNS | Servers must use AD DNS (or DNS that forwards to it) |
 | Time sync | Clock must be within 5 minutes of the DCs. The RHEL NTP pool is fine if the DCs are also accurate |
@@ -287,6 +309,21 @@ tester1 ansible_host=<TESTER1_IP>
 tester2 ansible_host=<TESTER2_IP>
 ```
 
+Mixed OSes — group them however you like; `linux_prod` must include them all:
+
+```ini
+[rhel]
+tester1 ansible_host=<TESTER1_IP>
+rhel7box ansible_host=<RHEL7_IP>
+
+[ubuntu]
+ubu1 ansible_host=<UBUNTU_IP> ansible_user=<your-ubuntu-user> ansible_become=true
+
+[linux_prod:children]
+rhel
+ubuntu
+```
+
 Already have your own group (e.g. `[myhosts]`)? The playbook targets `linux_prod`, so add:
 
 ```ini
@@ -335,15 +372,16 @@ The playbook is **idempotent** — safe to re-run, and it's how you add new serv
 **Hostnames:** `hostname -f` showing just `tester1` is fine — the join works with the short name. Don't rename production servers; apps, monitoring agents, licenses and certificates may depend on the name.
 
 ### What the playbook does
-1. Checks the OS is RHEL 8/9/10 family
-2. Installs `realmd`, `sssd`, `adcli`, `oddjob-mkhomedir`, `krb5-workstation`, `chrony`, etc.
-3. Keeps the existing NTP setup (or points chrony at the DCs if `manage_ntp: true`) and checks the clock is synchronised
-4. Joins the domain (password from vault, hidden from logs)
-5. Deploys `sssd.conf` (group-based access, `passwd` → AD, cached credentials)
-6. Enables auto-created home directories (`authselect sssd with-mkhomedir`)
-7. Grants sudo to `linux-prod-admins` (validated with `visudo`)
-8. Configures SSH for AD passwords and expired-password prompts (RHEL 8 and 9+ layouts)
-9. Verifies the join and optionally looks up a test user
+1. Checks Ansible can manage each server (installs Python 3 if missing; stops with instructions on an Ansible/Python mismatch)
+2. Checks the OS is supported and loads its settings from `vars/`
+3. Installs `realmd`, `sssd`, `adcli` and friends with `dnf`, `yum` or `apt`
+4. Keeps the existing NTP setup (or points chrony at the DCs if `manage_ntp: true`) and checks the clock is synchronised
+5. Joins the domain (password from vault, hidden from logs; on failure shows realm's reason)
+6. Deploys `sssd.conf` (group-based access, `passwd` → AD, cached credentials)
+7. Turns on SSSD logins and auto-created home directories (`authselect` / `authconfig` / `pam-auth-update`)
+8. Grants sudo to `linux-prod-admins` (validated with `visudo`)
+9. Configures SSH for AD passwords and expired-password prompts
+10. Verifies the join and optionally looks up a test user
 
 ---
 
@@ -389,7 +427,10 @@ An AD account in **neither** group must get "Permission denied".
 |---|---|
 | `New-ADGroup`: "Directory object not found" | The OU in `-Path` doesn't exist yet — create the OU first |
 | `New-ADOrganizationalUnit` not recognized | No AD module — run on a DC or install RSAT |
-| `realm discover bob.net` fails | Server isn't using AD DNS — check `/etc/resolv.conf` |
+| `realm discover bob.net` fails | Server isn't using AD DNS — check `/etc/resolv.conf` (Ubuntu: `resolvectl status`) |
+| "This Ansible ... cannot manage" | Ansible too new for the server's Python (usually RHEL 7) — see [RHEL 7 notes](#rhel-7-notes) |
+| "has no Python" in a dry run | Expected — a real run installs python3 first |
+| Ubuntu: `Permission denied` connecting as root | Use `ansible_user=<sudo user> ansible_become=true` and `-K` — see [Ubuntu notes](#ubuntu-notes) |
 | `realm join` / "Join the domain" fails | Join account rights on the OU; `ad_join_user` and vault password; OU path |
 | `no hosts matched` | `--limit` name isn't in group `linux_prod` in `inventory.ini` |
 | "Permission denied" for valid user | User in an allowed group? `sss_cache -E; systemctl restart sssd` |
@@ -400,6 +441,47 @@ An AD account in **neither** group must get "Permission denied".
 | Cloud password reset doesn't work on servers | Password Writeback not enabled in Entra Connect |
 
 More detail and an undo procedure: [RUNBOOK.md](RUNBOOK.md#part-7--if-something-fails).
+
+---
+
+## Ubuntu notes
+
+- **Connect as a sudo user.** Ubuntu usually blocks root SSH logins, so set the user per host and add `-K` to the command (Ansible asks for the sudo password):
+
+  ```ini
+  [ubuntu]
+  ubu1 ansible_host=<IP> ansible_user=<your-ubuntu-user> ansible_become=true
+  ```
+
+- **DNS check is different.** `/etc/resolv.conf` shows `127.0.0.53` (systemd-resolved), not your DNS servers. Check the real ones with:
+
+  ```bash
+  resolvectl status | grep -A2 "DNS Servers"
+  ```
+
+  They must be your AD DNS servers / DCs. `realm discover bob.net` is still the key test.
+
+- **Time sync:** with `manage_ntp: false` Ubuntu keeps its default `systemd-timesyncd`. With `manage_ntp: true` the playbook installs `chrony` (which replaces timesyncd) and points it at the DCs.
+- **Dry runs** may show `...ignoring` on the package step if the `python3-apt` helper isn't installed yet; the real run installs it automatically.
+
+## RHEL 7 notes
+
+- **End of life:** Red Hat's normal support ended June 2024. The playbook works on RHEL 7 and prints a reminder; plan an upgrade.
+- **Ansible version matters.** RHEL 7 has Python 2.7, and ansible-core **2.17 and newer** can't manage Python 2.7 servers. Check on the control node:
+
+  ```bash
+  ansible --version          # first line, e.g. "ansible [core 2.14.x]"
+  ```
+
+  **2.16 or lower** (what RHEL 9's `dnf install ansible-core` gives you) works as is. If yours is newer, the playbook stops on the RHEL 7 server *before changing anything* and tells you to install an older ansible-core alongside the current one:
+
+  ```bash
+  python3 -m venv ~/ansible-legacy
+  ~/ansible-legacy/bin/pip install 'ansible-core>=2.15,<2.16'
+  ~/ansible-legacy/bin/ansible-playbook -i inventory.ini ad-join.yml --ask-vault-pass --limit <rhel7-server>
+  ```
+
+- **Repositories:** the server must be able to install packages (`yum repolist` shows repos), e.g. through an Extended Life Cycle Support subscription or your internal mirror.
 
 ---
 
@@ -433,7 +515,11 @@ More detail and an undo procedure: [RUNBOOK.md](RUNBOOK.md#part-7--if-something-
 ├── group_vars/
 │   └── all/
 │       └── main.yml            # domain, OU, groups, options
+├── vars/                       # per-OS packages and tools
+│   ├── RedHat.yml              # RHEL 8, 9, 10
+│   ├── RedHat-7.yml            # RHEL 7
+│   └── Debian.yml              # Ubuntu 22.04+
 └── templates/
-    ├── sssd.conf.j2            # SSSD config
-    └── sshd-ad.conf.j2         # SSH drop-in for RHEL 9+
+    ├── sssd.conf.j2            # SSSD config (all OSes)
+    └── sshd-ad.conf.j2         # SSH drop-in (RHEL 9+, Ubuntu)
 ```

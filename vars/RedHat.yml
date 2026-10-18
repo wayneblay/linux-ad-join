@@ -1,0 +1,20 @@
+---
+# RHEL / Rocky / Alma 8, 9, 10
+adjoin_packages:
+  - realmd
+  - sssd
+  - sssd-ad
+  - sssd-tools
+  - adcli
+  - oddjob
+  - oddjob-mkhomedir
+  - samba-common-tools
+  - krb5-workstation
+  - authselect
+  - chrony
+pam_tool: authselect          # how SSSD logins + home directories are switched on
+mkhomedir_service: oddjobd    # service that creates home directories on first login
+chrony_conf: /etc/chrony.conf
+chrony_service: chronyd
+chrony_package: chrony
+ssh_service: sshd

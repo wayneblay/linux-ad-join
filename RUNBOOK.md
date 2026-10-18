@@ -51,11 +51,13 @@ All of these must be true before you touch a server. Most are done in **Active D
 
 Log in to tester1 with your local account. If a check fails, fix it before Part 3.
 
-**1. OS version** – must be RHEL 8, 9 or 10.
+**1. OS version** – RHEL 7–10 or Ubuntu 22.04+.
 
 ```bash
-cat /etc/redhat-release
+cat /etc/os-release
 ```
+
+Adding a **RHEL 7** or **Ubuntu** server? Read the [RHEL 7](README.md#rhel-7-notes) / [Ubuntu](README.md#ubuntu-notes) notes first: on Ubuntu the DNS check in step 3 uses `resolvectl status`, and you connect as a sudo user with `-K`. Test **one server of each new type** before the rest.
 
 **2. Hostname**
 

@@ -1,11 +1,93 @@
 ---
-# Join RHEL 8/9 servers to Active Directory with SSSD so team members log in
+# Join Linux servers to Active Directory with SSSD so team members log in
 # with their AD credentials and can change their AD password with `passwd`.
+#
+# Supported: RHEL/Rocky/Alma 7, 8, 9, 10 and Ubuntu 22.04 or newer.
 #
 # Run:   ansible-playbook -i inventory.ini ad-join.yml --ask-vault-pass
 # Test:  add  --limit <one-host>  first, and  --check --diff  for a dry run.
 
-- name: Join RHEL servers to Active Directory
+# ============================================================================
+# Play 1 - can this Ansible manage each server?
+# Runs without Python on the server (raw), so it works before anything else.
+# ============================================================================
+- name: Check Ansible can manage each server
+  hosts: linux_prod
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Find the server's Python and OS
+      ansible.builtin.raw: |
+        . /etc/os-release 2>/dev/null; echo "os=${ID:-unknown} ${VERSION_ID:-}"
+        for p in python3 python2 python /usr/libexec/platform-python; do
+          if command -v "$p" >/dev/null 2>&1; then
+            echo "python=$(command -v $p) $($p -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"
+            exit 0
+          fi
+        done
+        echo "python=none"
+      register: host_probe
+      changed_when: false
+      check_mode: false
+
+    - name: Record what was found
+      ansible.builtin.set_fact:
+        probe_os: "{{ (host_probe.stdout | regex_search('os=(.*)', '\\1') or ['unknown']) | first | trim }}"
+        probe_python: "{{ (host_probe.stdout | regex_search('python=(.*)', '\\1') or ['none']) | first | trim }}"
+
+    - name: Install Python 3 on servers that have none
+      ansible.builtin.raw: |
+        if command -v apt-get >/dev/null 2>&1; then
+          apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3
+        elif command -v dnf >/dev/null 2>&1; then
+          dnf install -y -q python3
+        elif command -v yum >/dev/null 2>&1; then
+          yum install -y -q python3 || yum install -y -q python
+        else
+          echo "No apt-get, dnf or yum found" >&2; exit 1
+        fi
+      register: python_install
+      when:
+        - probe_python == 'none'
+        - not ansible_check_mode
+      changed_when: true
+      failed_when: false
+
+    - name: Stop if Python is missing and couldn't be installed
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} has no Python, which Ansible needs.
+          {{ 'This is a dry run, so nothing was installed: run it without --check and the playbook installs python3 itself.'
+             if ansible_check_mode else
+             'Installing python3 failed: ' ~ ((python_install.stderr | default('')) | trim)
+             ~ ' -- check the server can reach its package repositories (subscription-manager / dnf repolist / apt sources).' }}
+      when:
+        - probe_python == 'none'
+        - ansible_check_mode or (python_install.rc | default(1)) != 0
+
+    - name: Test that Ansible can run on the server
+      ansible.builtin.ping:
+      register: ping_result
+      ignore_errors: true
+
+    - name: Explain how to fix an Ansible / Python mismatch
+      ansible.builtin.fail:
+        msg: >-
+          This Ansible ({{ ansible_version.full }}) cannot manage {{ inventory_hostname }}
+          ({{ probe_os }}, Python {{ probe_python }}). This usually means an older OS such as RHEL 7:
+          ansible-core 2.17 and newer need a newer Python on the server than RHEL 7 provides.
+          FIX on the control node - install an older ansible-core alongside the current one:
+          python3 -m venv ~/ansible-legacy &&
+          ~/ansible-legacy/bin/pip install 'ansible-core>=2.15,<2.16'
+          then run the same command with ~/ansible-legacy/bin/ansible-playbook
+          (e.g. ~/ansible-legacy/bin/ansible-playbook -i inventory.ini ad-join.yml --ask-vault-pass --limit {{ inventory_hostname }}).
+      when: ping_result is failed
+
+# ============================================================================
+# Play 2 - join the domain
+# ============================================================================
+- name: Join Linux servers to Active Directory
   hosts: linux_prod
   become: true
 
@@ -13,68 +95,110 @@
     - vault.yml
 
   pre_tasks:
-    - name: Confirm this is RHEL (or a rebuild) 8 or 9
+    - name: Confirm this OS is supported
       ansible.builtin.assert:
-        that:
-          - ansible_os_family == "RedHat"
-          - ansible_distribution_major_version in ["8", "9", "10"]
-        fail_msg: "Supported on RHEL 8/9/10 family only (found {{ ansible_distribution }} {{ ansible_distribution_version }})"
+        that: >-
+          (ansible_os_family == "RedHat" and ansible_distribution_major_version in ["7", "8", "9", "10"])
+          or (ansible_distribution == "Ubuntu" and ansible_distribution_version is version('22.04', '>='))
+        fail_msg: >-
+          Supported: RHEL/Rocky/Alma 7-10 and Ubuntu 22.04+
+          (found {{ ansible_distribution }} {{ ansible_distribution_version }})
+
+    - name: Load settings for this OS
+      ansible.builtin.include_vars: "{{ item }}"
+      with_first_found:
+        - "vars/{{ ansible_os_family }}-{{ ansible_distribution_major_version }}.yml"
+        - "vars/{{ ansible_os_family }}.yml"
+
+    - name: Note that RHEL 7 is end of life
+      ansible.builtin.debug:
+        msg: "RHEL 7 is past end of life. This works, but plan an upgrade for {{ inventory_hostname }}."
+      when: ansible_os_family == "RedHat" and ansible_distribution_major_version == "7"
 
   tasks:
     # ------------------------------------------------------------------ packages
-    - name: Install AD integration packages
-      ansible.builtin.dnf:
-        name:
-          - realmd
-          - sssd
-          - sssd-ad
-          - sssd-tools
-          - adcli
-          - oddjob
-          - oddjob-mkhomedir
-          - samba-common-tools
-          - krb5-workstation
-          - authselect
-          - chrony
+    - name: Pre-set the Kerberos realm so the Ubuntu package install doesn't prompt
+      ansible.builtin.command: debconf-set-selections
+      args:
+        stdin: "krb5-config krb5-config/default_realm string {{ ad_realm }}"
+      changed_when: false
+      when: ansible_os_family == "Debian" and not ansible_check_mode
+
+    - name: Install AD integration packages (RHEL)
+      ansible.builtin.package:
+        name: "{{ adjoin_packages }}"
         state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Install AD integration packages (Ubuntu)
+      ansible.builtin.apt:
+        name: "{{ adjoin_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+      ignore_errors: "{{ ansible_check_mode }}"   # dry run: python3-apt may be missing; a real run installs it
 
     # ---------------------------------------------------------------- time sync
     # Only when manage_ntp is true: switch chrony to the domain controllers.
-    # When false, the existing /etc/chrony.conf (e.g. RHEL NTP pool) is left as is.
+    # When false, the existing time sync (RHEL NTP pool, Ubuntu timesyncd, ...)
+    # is left exactly as it is.
+    - name: Install chrony (Ubuntu, only when managing NTP)
+      ansible.builtin.apt:
+        name: "{{ chrony_package }}"
+        state: present
+      when: manage_ntp | bool and ansible_os_family == "Debian"
+
     - name: Comment out default NTP pool/server lines
       ansible.builtin.replace:
-        path: /etc/chrony.conf
+        path: "{{ chrony_conf }}"
         regexp: '^(pool|server) (?!.*# ad-join)(.*)$'
         replace: '# \1 \2'
       when: manage_ntp | bool
-      notify: Restart chronyd
+      notify: Restart chrony
 
     - name: Point chrony at the domain controllers
       ansible.builtin.blockinfile:
-        path: /etc/chrony.conf
+        path: "{{ chrony_conf }}"
         marker: "# {mark} ANSIBLE MANAGED - AD time sources"
         block: |
           {% for s in ntp_servers %}
           server {{ s }} iburst # ad-join
           {% endfor %}
       when: manage_ntp | bool
-      notify: Restart chronyd
+      notify: Restart chrony
 
-    - name: Enable chronyd
+    - name: Enable chrony
       ansible.builtin.service:
-        name: chronyd
+        name: "{{ chrony_service }}"
         state: started
         enabled: true
+      when: ansible_os_family == "RedHat" or (manage_ntp | bool)
 
     - name: Apply time settings before joining (Kerberos needs accurate clocks)
       ansible.builtin.meta: flush_handlers
 
     - name: Check the clock is synchronised
-      ansible.builtin.command: chronyc -n tracking
-      register: chrony_tracking
+      ansible.builtin.command: timedatectl status
+      register: clock_status
       check_mode: false
       changed_when: false
-      failed_when: "'Not synchronised' in chrony_tracking.stdout"
+      failed_when: false
+      until: "clock_status.stdout is not search('(NTP synchronized|System clock synchronized): no')"
+      retries: 6
+      delay: 10
+
+    - name: Stop if the clock isn't synchronised (Kerberos needs it within 5 minutes of AD)
+      ansible.builtin.fail:
+        msg: >-
+          The clock on {{ inventory_hostname }} isn't synchronised. Fix time sync first
+          (check 'timedatectl status'), or set manage_ntp: true to sync from the DCs.
+      when: "clock_status.stdout is search('(NTP synchronized|System clock synchronized): no')"
+
+    - name: Warn if the clock status couldn't be read
+      ansible.builtin.debug:
+        msg: "Couldn't read the clock status (timedatectl rc={{ clock_status.rc }}). Continuing; a clock problem would show up at the join."
+      when: clock_status.rc != 0
 
     # --------------------------------------------------------------------- join
     - name: Check whether the host is already joined
@@ -96,7 +220,7 @@
 
     - name: Note skipped domain check in dry run
       ansible.builtin.debug:
-        msg: "realmd not installed yet, so 'realm discover' was skipped in this dry run. Install it first to test discovery: dnf install -y realmd"
+        msg: "realmd not installed yet, so 'realm discover' was skipped in this dry run."
       when: ansible_check_mode and (realm_list.rc | default(1)) != 0
 
     - name: Join the domain
@@ -137,26 +261,68 @@
         group: root
         mode: "0600"
         backup: true
-      ignore_errors: "{{ ansible_check_mode }}"   # dry run: package may not be installed yet
       notify: Restart sssd
+      ignore_errors: "{{ ansible_check_mode }}"   # dry run: package may not be installed yet
 
+    # ---- SSSD logins + home directories: RHEL 8+ (authselect)
     - name: Check current authselect profile
       ansible.builtin.command: authselect current --raw
       register: authselect_current
       check_mode: false
       changed_when: false
       failed_when: false
+      when: pam_tool == "authselect"
 
     - name: Use the SSSD auth profile with auto-created home directories
       ansible.builtin.command: authselect select sssd with-mkhomedir --force
       changed_when: true
-      when: "'sssd' not in authselect_current.stdout or 'with-mkhomedir' not in authselect_current.stdout"
+      when:
+        - pam_tool == "authselect"
+        - "'sssd' not in authselect_current.stdout or 'with-mkhomedir' not in authselect_current.stdout"
 
-    - name: Enable oddjobd (creates home dirs on first login)
+    # ---- SSSD logins + home directories: RHEL 7 (authconfig)
+    - name: Check whether SSSD logins and home directories are enabled (RHEL 7)
+      ansible.builtin.shell: >
+        grep -q pam_sss.so /etc/pam.d/system-auth &&
+        grep -q pam_oddjob_mkhomedir.so /etc/pam.d/system-auth &&
+        grep -Eq '^passwd:.*sss' /etc/nsswitch.conf
+      register: authconfig_state
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      when: pam_tool == "authconfig"
+
+    - name: Enable SSSD logins and auto-created home directories (RHEL 7)
+      ansible.builtin.command: authconfig --enablesssd --enablesssdauth --enablemkhomedir --update
+      changed_when: true
+      when:
+        - pam_tool == "authconfig"
+        - authconfig_state.rc != 0
+
+    # ---- SSSD logins + home directories: Ubuntu (pam-auth-update)
+    - name: Check whether SSSD logins and home directories are enabled (Ubuntu)
+      ansible.builtin.shell: >
+        grep -q pam_sss.so /etc/pam.d/common-auth &&
+        grep -q pam_mkhomedir.so /etc/pam.d/common-session
+      register: pam_state
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      when: pam_tool == "pam-auth-update"
+
+    - name: Enable SSSD logins and auto-created home directories (Ubuntu)
+      ansible.builtin.command: pam-auth-update --enable sss mkhomedir
+      changed_when: true
+      when:
+        - pam_tool == "pam-auth-update"
+        - pam_state.rc != 0
+
+    - name: Enable the home-directory service (RHEL)
       ansible.builtin.service:
-        name: oddjobd
+        name: "{{ mkhomedir_service }}"
         state: started
         enabled: true
+      when: mkhomedir_service | length > 0
       ignore_errors: "{{ ansible_check_mode }}"   # dry run: package may not be installed yet
 
     - name: Enable sssd
@@ -186,7 +352,14 @@
       changed_when: false
       failed_when: false
 
-    - name: Deploy sshd drop-in (RHEL 9+)
+    - name: Make sure sshd's runtime folder exists (needed to validate config on Ubuntu)
+      ansible.builtin.file:
+        path: /run/sshd
+        state: directory
+        mode: "0755"
+      when: ansible_os_family == "Debian"
+
+    - name: Deploy sshd drop-in (RHEL 9+, Ubuntu 22.04+)
       ansible.builtin.template:
         src: sshd-ad.conf.j2
         dest: /etc/ssh/sshd_config.d/40-ad-auth.conf
@@ -197,7 +370,7 @@
       when: sshd_include.rc == 0
       notify: Reload sshd
 
-    - name: Set sshd options in main config (RHEL 8)
+    - name: Set sshd options in main config (RHEL 7, RHEL 8)
       ansible.builtin.lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^\s*#?\s*{{ item.key }}\s'
@@ -237,9 +410,9 @@
       when: ad_test_user is defined
 
   handlers:
-    - name: Restart chronyd
+    - name: Restart chrony
       ansible.builtin.service:
-        name: chronyd
+        name: "{{ chrony_service }}"
         state: restarted
 
     - name: Restart sssd
@@ -248,5 +421,5 @@
 
     - name: Reload sshd
       ansible.builtin.service:
-        name: sshd
+        name: "{{ ssh_service }}"
         state: reloaded
