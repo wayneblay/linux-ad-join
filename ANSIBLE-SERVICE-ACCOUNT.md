@@ -1,54 +1,52 @@
 # Ansible Service Account Setup
 
-Run Ansible through a dedicated, key-only service account instead of SSHing in as `root`.
+Run Ansible through a dedicated, key-only service account (`ansible-srv`) on every server, instead of SSHing in as `root`.
 This works alongside the AD join: `ansible-srv` is a local account, so the AD group rules don't affect it.
 
 ```
 [ CONTROL NODE ]                                   [ EVERY SERVER ]
-User: ansible-mgr  (one per admin, no sudo)        User: ansible-srv  (local, password locked)
-Holds: private key, protected by a passphrase ===> Holds: public key, accepted only from the control node IP
+User: your own admin account                       User: ansible-srv  (local, password locked)
+Holds: private key, protected by a passphrase ===> Holds: your public key, accepted only from the control node IP
 Logs:  every playbook run (~/ansible.log)          Sudo:  passwordless, file validated with visudo
 ```
 
 | | Before | After |
 |---|---|---|
-| How Ansible connects | `-u root` (Ubuntu: your user + `-K`) | `ansible-srv` with a key, set once in the inventory |
+| How Ansible connects | `-u root` (Ubuntu: your user + `-K`) | `ansible-srv` with your key, set once in the inventory |
 | Root SSH logins needed | Yes | No — can be turned off once this works |
-| Who ran a playbook | Unknown | Each admin's own `ansible-mgr`-style login + Ansible log |
+| Record of what ran | None | Ansible log on the control node |
+
+> **One admin running Ansible?** Use your own account on the control node, as below.
+> **Several admins?** Give each their own control-node account — see [More than one admin](#more-than-one-admin).
 
 ---
 
-## Phase 1 — Control node (RHEL 9)
+## Phase 1 — Control node (as your own account)
 
-### 1. Install Ansible (as your normal admin account)
-
-```bash
-sudo dnf install -y ansible-core        # from RHEL AppStream — no EPEL needed
-ansible --version
-```
-
-Ubuntu control node: `sudo apt update && sudo apt install -y ansible-core`.
-
-### 2. Create the manager account — no sudo
-
-`ansible-mgr` only runs playbooks; it doesn't need root on the control node. Don't add it to `wheel` / `sudo`.
+### 1. Ansible is installed
 
 ```bash
-sudo useradd -m -s /bin/bash ansible-mgr
-sudo passwd ansible-mgr
+ansible --version                        # RHEL 9: sudo dnf install -y ansible-core if missing (no EPEL needed)
 ```
 
-> For accountability, give **each admin their own** account (e.g. `wayne-ansible`) rather than sharing one.
+### 2. Your SSH key — with a passphrase
 
-### 3. Create the key — with a passphrase
-
-That key will have passwordless root on every server, so protect it:
+That key will have passwordless root on every server, so protect it. Check whether you already have one:
 
 ```bash
-sudo -iu ansible-mgr
-ssh-keygen -t ed25519 -C "ansible-mgr@control-node"     # set a passphrase when asked
-ls -l ~/.ssh                                            # id_ed25519 must be -rw------- (600)
+ls -l ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
 ```
+
+- **No key yet:** create one and set a passphrase when asked:
+  ```bash
+  ssh-keygen -t ed25519 -C "ansible@control-node"
+  ```
+- **Key exists without a passphrase** (e.g. the one you use for root today): add one — the key itself doesn't change, so nothing on the servers breaks:
+  ```bash
+  ssh-keygen -p -f ~/.ssh/id_ed25519
+  ```
+
+The private key `~/.ssh/id_ed25519` must be `-rw-------` (600). It never leaves the control node — only the `.pub` file is copied to the servers.
 
 At the start of each work session, unlock it once:
 
@@ -59,9 +57,9 @@ ssh-add ~/.ssh/id_ed25519      # type the passphrase once
 
 > Only for unattended jobs (cron/CI) consider a key without a passphrase — and then the `from=` restriction below is essential.
 
-### 4. Turn on Ansible's own log
+### 3. Turn on Ansible's own log
 
-The servers only see `ansible-srv` running Python, so the useful record is on the control node:
+The servers only see `ansible-srv` running Python, so the useful record of what ran is on the control node:
 
 ```bash
 cat > ~/.ansible.cfg <<'EOF'
@@ -72,38 +70,40 @@ EOF
 
 Passwords stay out of the log: the join step uses `no_log`.
 
-### 5. Copy the project into this account
-
-```bash
-cd ~
-curl -L -o linux-ad-join.zip https://github.com/wayneblay/linux-ad-join/archive/refs/heads/main.zip
-unzip -q linux-ad-join.zip && cd linux-ad-join-main
-```
-
-Copy your existing `inventory.ini`, `group_vars/all/main.yml` and `vault.yml` into it.
-
 ---
 
 ## Phase 2 — Create `ansible-srv` on every server
 
 ### Option A — the playbook (recommended)
 
-Run it from your **current** admin account — the one that already reaches the servers as root, the way you ran `ad-join.yml` — pointing it at `ansible-mgr`'s public key:
+From your project folder on the control node, using your **current** access (root, or your sudo user on Ubuntu) — the same way you ran `ad-join.yml`:
 
 ```bash
-# make ansible-mgr's public key readable to your account (it's public, so this is safe)
-sudo cp /home/ansible-mgr/.ssh/id_ed25519.pub /tmp/ansible-mgr.pub && sudo chmod 644 /tmp/ansible-mgr.pub
+cd ~/linux-ad-join-main          # your working folder
+hostname -I                      # note the control node's IP
 
-cd ~/linux-ad-join-main          # your current working folder
+# one server first
 ansible-playbook -i inventory.ini create-service-account.yml -u root \
-  -e svc_pubkey_file=/tmp/ansible-mgr.pub -e control_node_ip=<CONTROL_NODE_IP> --limit tester1
+  -e control_node_ip=<CONTROL_NODE_IP> --limit tester1
+
+# then every server in the inventory (add -K if Ubuntu servers are included)
+ansible-playbook -i inventory.ini create-service-account.yml -u root \
+  -e control_node_ip=<CONTROL_NODE_IP>
 ```
 
-- Test on one server first (`--limit tester1`), then drop `--limit` for the rest.
-- Ubuntu servers that connect as your sudo user: add `-K`.
-- Find the control node's IP with `hostname -I`.
+By default it installs **your** public key, `~/.ssh/id_ed25519.pub`. Using a different key file? Add `-e svc_pubkey_file=/path/to/key.pub`.
 
-It creates `ansible-srv` with a locked password, installs the key (accepted only from the control node IP), fixes SELinux labels on RHEL, and adds a sudoers file that's validated with `visudo` before it's saved. Safe to re-run.
+In a mixed inventory, Ubuntu servers keep their own `ansible_user=...` from the inventory (it overrides `-u root`), so one command covers all; `-K` asks for the sudo password once.
+
+On each server it:
+
+1. creates `ansible-srv` with a locked password (key login only)
+2. creates its `.ssh` folder (700)
+3. installs your **public** key (600), accepted only from the control node IP (`from=`)
+4. fixes SELinux labels on RHEL
+5. adds `/etc/sudoers.d/ansible-srv`, checked with `visudo` before it's saved
+
+Safe to re-run. Each run **replaces** `ansible-srv`'s key file, which is also how you rotate the key.
 
 ### Option B — by hand, on each server
 
@@ -112,7 +112,7 @@ sudo useradd -m -s /bin/bash ansible-srv
 sudo passwd -l ansible-srv                                  # key login only
 
 sudo mkdir -p /home/ansible-srv/.ssh
-echo 'from="<CONTROL_NODE_IP>" <PASTE ansible-mgr PUBLIC KEY>' | sudo tee /home/ansible-srv/.ssh/authorized_keys
+echo 'from="<CONTROL_NODE_IP>" <PASTE YOUR PUBLIC KEY>' | sudo tee /home/ansible-srv/.ssh/authorized_keys
 sudo chown -R ansible-srv:ansible-srv /home/ansible-srv/.ssh
 sudo chmod 700 /home/ansible-srv/.ssh
 sudo chmod 600 /home/ansible-srv/.ssh/authorized_keys
@@ -123,7 +123,7 @@ sudo chmod 440 /etc/sudoers.d/ansible-srv
 sudo visudo -cf /etc/sudoers.d/ansible-srv                  # must say "parsed OK"
 ```
 
-Get the public key with `cat ~/.ssh/id_ed25519.pub` (as `ansible-mgr` on the control node).
+Get your public key with `cat ~/.ssh/id_ed25519.pub` on the control node.
 
 ---
 
@@ -131,7 +131,7 @@ Get the public key with `cat ~/.ssh/id_ed25519.pub` (as `ansible-mgr` on the con
 
 ### 1. Test
 
-As `ansible-mgr` on the control node:
+From your account on the control node:
 
 ```bash
 ssh ansible-srv@<SERVER_IP> 'sudo whoami'                          # prints: root  (no password asked)
@@ -168,7 +168,7 @@ sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 sudo sshd -t && sudo systemctl reload sshd        # Ubuntu: reload ssh
 ```
 
-Keep your existing session open while testing a new login.
+Keep your existing session open while testing a new login. After this, `create-service-account.yml` for **new** servers is run once with `-u root` before root login is turned off on them.
 
 ---
 
@@ -178,9 +178,20 @@ Keep your existing session open while testing a new login.
 |---|---|
 | Start a session | `eval "$(ssh-agent)"; ssh-add` |
 | See what was run | `less ~/ansible.log` |
-| Add a new server | Add it to `inventory.ini`, run `create-service-account.yml` once with your admin account (`-u root -e svc_pubkey_file=/tmp/ansible-mgr.pub --limit <server>`), then `ad-join.yml` |
-| Rotate the key | `ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_new` → re-run `create-service-account.yml -e svc_pubkey_file=~/.ssh/id_ed25519_new.pub` (replaces the old key) → test with the new key → delete the old key files |
-| Someone leaves | Remove their control-node account; rotate the key if they could read it |
+| Add a new server | Add it to `inventory.ini`, run `create-service-account.yml -u root -e control_node_ip=<IP> --limit <server>` once, then `ad-join.yml` |
+| Rotate the key | `ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_new` → re-run `create-service-account.yml -e svc_pubkey_file=~/.ssh/id_ed25519_new.pub -e control_node_ip=<IP>` (replaces the old key) → test with the new key → make it your default key |
+
+## More than one admin
+
+When others start running Ansible, give each person their own control-node account so the log shows who ran what — no sudo needed on it:
+
+```bash
+sudo useradd -m -s /bin/bash <name>-ansible
+sudo passwd <name>-ansible
+# as that user: ssh-keygen -t ed25519, and set up ~/.ansible.cfg as in Phase 1
+```
+
+Then install their public key on the servers. `create-service-account.yml` installs **one** key and replaces the file, so with several admins either list all keys in one file and pass it with `-e svc_pubkey_file=...`, or add each extra key as a new line in `/home/ansible-srv/.ssh/authorized_keys` (with the same `from="..."` prefix).
 
 ## Troubleshooting
 
@@ -190,4 +201,5 @@ Keep your existing session open while testing a new login.
 | Works on Ubuntu, fails on RHEL | SELinux labels | `sudo restorecon -Rv /home/ansible-srv/.ssh` |
 | Asked for a password on `sudo` | Sudoers file missing or invalid | `sudo visudo -cf /etc/sudoers.d/ansible-srv` |
 | Asked for the key passphrase every time | ssh-agent not running | `eval "$(ssh-agent)"; ssh-add` |
-| `ssh -v` shows "key not accepted" from a jump host | `from=` blocks other IPs | Run Ansible from the control node only, or add that IP: `from="IP1,IP2"` |
+| "Could not find or access ... id_ed25519.pub" | No key yet, or a different file name | Create one (Phase 1 step 2) or pass `-e svc_pubkey_file=...` |
+| Key refused from another machine | `from=` allows only the control node | Run Ansible from the control node, or allow more IPs: `from="IP1,IP2"` |
