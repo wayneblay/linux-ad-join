@@ -21,6 +21,36 @@ Logs:  every playbook run (~/ansible.log)          Sudo:  passwordless, file val
 
 ---
 
+## Quick start — in this order
+
+1. **Control node, once:** make sure you have a key with a passphrase, turn on the Ansible log, unlock the key:
+   ```bash
+   ls ~/.ssh/id_ed25519.pub || ssh-keygen -t ed25519      # create a key if you have none
+   ssh-keygen -p -f ~/.ssh/id_ed25519                     # add a passphrase if it has none
+   printf '[defaults]\nlog_path = ~/ansible.log\n' > ~/.ansible.cfg
+   eval "$(ssh-agent)"; ssh-add
+   ```
+2. **Create `ansible-srv` on one server** (with the root access you have today):
+   ```bash
+   cd ~/linux-ad-join-main
+   ansible-playbook -i inventory.ini create-service-account.yml -u root -e control_node_ip=<CONTROL_NODE_IP> --limit tester1
+   ```
+3. **Test it** — must reply `root`:
+   ```bash
+   ansible -i inventory.ini tester1 -u ansible-srv -b -m command -a whoami
+   ```
+4. **All servers:** run step 2 without `--limit` (add `-K` if Ubuntu servers are included), then add to `inventory.ini`:
+   ```ini
+   [linux_prod:vars]
+   ansible_user=ansible-srv
+   ansible_become=true
+   ```
+5. **From now on** run everything without `-u root` / `-K`, e.g. `ansible-playbook -i inventory.ini ad-join.yml --ask-vault-pass --limit <server>`.
+
+Servers already joined to AD (tester1, tester2) are a safe place to start: this playbook only adds `ansible-srv` and doesn't touch the AD setup.
+
+---
+
 ## Phase 1 — Control node (as your own account)
 
 ### 1. Ansible is installed
@@ -31,7 +61,15 @@ ansible --version                        # RHEL 9: sudo dnf install -y ansible-c
 
 ### 2. Your SSH key — with a passphrase
 
-That key will have passwordless root on every server, so protect it. Check whether you already have one:
+That key will have passwordless root on every server, so protect it.
+
+> **Why a passphrase?** It goes on the **private** key (`~/.ssh/id_ed25519`); the `.pub` file is meant to be shared.
+> Whoever has the private key file has root on every server. The passphrase encrypts that file, so a copy that leaks
+> (a backup, another admin reading your home folder, a file copied by mistake) is useless without it.
+> `from=` already blocks the key when it's used from any other machine; the passphrase also covers someone on the control node itself.
+> You type it **once per session** (`ssh-add`), not on every command. It's optional — everything works without it.
+
+Check whether you already have one:
 
 ```bash
 ls -l ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
