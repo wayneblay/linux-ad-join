@@ -15,6 +15,7 @@ Work through the parts in order; each part ends with a check. Don't move on unti
 | 5 | Real run on tester1 | Control node | 5 min |
 | 6 | Test logins, password change, sudo | Any workstation | 15 min |
 | 7 | If something fails / undo | — | — |
+| — | Adding a RHEL 7 or Ubuntu server | Control node + server | 30 min |
 | 8 | After the pilot | — | — |
 
 ### Values used below
@@ -57,7 +58,7 @@ Log in to tester1 with your local account. If a check fails, fix it before Part 
 cat /etc/os-release
 ```
 
-Adding a **RHEL 7** or **Ubuntu** server? Read the [RHEL 7](README.md#rhel-7-notes) / [Ubuntu](README.md#ubuntu-notes) notes first: on Ubuntu the DNS check in step 3 uses `resolvectl status`, and you connect as a sudo user with `-K`. Test **one server of each new type** before the rest.
+Adding a **RHEL 7** or **Ubuntu** server? Read the [RHEL 7](README.md#rhel-7-notes) / [Ubuntu](README.md#ubuntu-notes) notes first: on Ubuntu the DNS check in step 3 uses `resolvectl status`, and you connect as a sudo user with `-K`. Test **one server of each new type** before the rest — full steps in [Adding a RHEL 7 or Ubuntu server](#adding-a-rhel-7-or-ubuntu-server).
 
 **2. Hostname**
 
@@ -311,6 +312,72 @@ sudo systemctl reload sshd
 ```
 
 Then delete the `tester1` computer object from the Linux OU in ADUC. Local accounts are unaffected.
+
+---
+
+## Adding a RHEL 7 or Ubuntu server
+
+Same steps as tester1, with a few differences. Do **one server of each new type** first.
+Examples below use `rhel7box` and `ubu1`; use your own names.
+
+**1. Get the latest files** (keeps your `inventory.ini`, `group_vars/all/main.yml` and `vault.yml`):
+
+```bash
+cd ~
+curl -L -o linux-ad-join.zip https://github.com/wayneblay/linux-ad-join/archive/refs/heads/main.zip
+rm -rf /tmp/new-adjoin && mkdir /tmp/new-adjoin && unzip -q linux-ad-join.zip -d /tmp/new-adjoin
+cd ~/linux-ad-join-main                     # your working folder
+cp /tmp/new-adjoin/linux-ad-join-main/ad-join.yml /tmp/new-adjoin/linux-ad-join-main/README.md /tmp/new-adjoin/linux-ad-join-main/RUNBOOK.md .
+cp -r /tmp/new-adjoin/linux-ad-join-main/vars /tmp/new-adjoin/linux-ad-join-main/templates .
+ls vars/                                    # Debian.yml  RedHat-7.yml  RedHat.yml
+```
+
+**2. Add the server to `inventory.ini`** (inside a group that's part of `linux_prod`):
+
+```ini
+rhel7box ansible_host=<RHEL7_IP>
+ubu1 ansible_host=<UBUNTU_IP> ansible_user=<your-ubuntu-user> ansible_become=true
+```
+
+Ubuntu usually blocks root SSH, so it connects as your sudo user — add **`-K`** to every Ubuntu command (it asks for that user's sudo password).
+
+**3. Pre-checks** (Part 2), with these differences:
+
+| Check | RHEL 7 | Ubuntu |
+|---|---|---|
+| OS version | `cat /etc/redhat-release` | `cat /etc/os-release` |
+| DNS servers | `cat /etc/resolv.conf` | `resolvectl status \| grep -A2 "DNS Servers"` (resolv.conf shows `127.0.0.53`) |
+| Install realmd for `realm discover` | `sudo yum install -y realmd` | `sudo apt-get install -y realmd` |
+| Domain found | `realm discover bob.net` | `realm discover bob.net` |
+
+RHEL 7 only: check your Ansible version on the control node — `ansible --version`. **2.16 or lower** works; if newer, the playbook stops on the RHEL 7 server before changing anything and prints the fix ([RHEL 7 notes](README.md#rhel-7-notes)).
+
+**4. Connectivity:**
+
+```bash
+ansible -i inventory.ini rhel7box -u root -m ping
+ansible -i inventory.ini ubu1 -K -m ping
+```
+
+**5. Dry run:**
+
+```bash
+ansible-playbook -i inventory.ini ad-join.yml -u root --ask-vault-pass --limit rhel7box --check --diff
+ansible-playbook -i inventory.ini ad-join.yml -K --ask-vault-pass --limit ubu1 --check --diff
+```
+
+Expect `failed=0`. `...ignoring` lines are fine in a dry run. A "has no Python" stop in a dry run is expected too — the real run installs it.
+
+**6. Real run:**
+
+```bash
+ansible-playbook -i inventory.ini ad-join.yml -u root --ask-vault-pass --limit rhel7box -e ad_test_user=<test-user>
+ansible-playbook -i inventory.ini ad-join.yml -K --ask-vault-pass --limit ubu1 -e ad_test_user=<test-user>
+```
+
+RHEL 7 also prints a reminder that it's end of life — that's expected.
+
+**7. Test logins** exactly as in Part 6 (`ssh <test-user>@<IP>`, `id`, `sudo -l`), keeping a break-glass session open.
 
 ---
 

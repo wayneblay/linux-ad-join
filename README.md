@@ -446,6 +446,9 @@ More detail and an undo procedure: [RUNBOOK.md](RUNBOOK.md#part-7--if-something-
 
 ## Ubuntu notes
 
+Step-by-step commands for testing a new Ubuntu or RHEL 7 server: [RUNBOOK — Adding a RHEL 7 or Ubuntu server](RUNBOOK.md#adding-a-rhel-7-or-ubuntu-server).
+
+
 - **Connect as a sudo user.** Ubuntu usually blocks root SSH logins, so set the user per host and add `-K` to the command (Ansible asks for the sudo password):
 
   ```ini
