@@ -6,6 +6,8 @@ AD is the single source of truth — nothing is copied or synced to the servers.
 
 **First time?** Follow [RUNBOOK.md](RUNBOOK.md) — a step-by-step checklist for piloting on one or two test servers.
 
+**Production setup:** run Ansible through a key-only service account instead of root — see [ANSIBLE-SERVICE-ACCOUNT.md](ANSIBLE-SERVICE-ACCOUNT.md).
+
 > **Example values used throughout:** domain `bob.net` (realm `BOB.NET`), computer OU `OU=Linux,DC=bob,DC=net`,
 > test servers `tester1` and `tester2`. Replace them with your real values **on the control node only** —
 > this repository is public, so never commit real domain names, IPs or passwords.
@@ -512,7 +514,9 @@ Step-by-step commands for testing a new Ubuntu or RHEL 7 server: [RUNBOOK — Ad
 .
 ├── README.md
 ├── RUNBOOK.md                  # step-by-step pilot checklist
+├── ANSIBLE-SERVICE-ACCOUNT.md  # key-only service account instead of root
 ├── ad-join.yml                 # the playbook
+├── create-service-account.yml  # creates ansible-srv on every server
 ├── inventory.ini               # list of servers
 ├── vault.yml.example           # shows the one line the vault needs
 ├── group_vars/
